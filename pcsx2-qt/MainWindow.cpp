@@ -1723,8 +1723,36 @@ void MainWindow::onCreateMemoryCardOpenRequested()
 
 void MainWindow::updateTheme()
 {
+	// The debugger hates theme changes.
+	// We have unfortunately to destroy it and recreate it.
+	const bool debugger_is_open = m_debugger_window ? m_debugger_window->isVisible() : false;
+	const QSize debugger_size = m_debugger_window ? m_debugger_window->size() : QSize();
+	const QPoint debugger_pos = m_debugger_window ? m_debugger_window->pos() : QPoint();
+	if (m_debugger_window)
+	{
+		if (QMessageBox::question(this, tr("Theme Change"),
+				tr("Changing the theme will close the debugger window. Any unsaved data will be lost. Do you want to continue?"),
+				QMessageBox::Yes | QMessageBox::No) == QMessageBox::No)
+		{
+			return;
+		}
+	}
+
 	QtHost::UpdateApplicationTheme();
 	reloadThemeSpecificImages();
+
+	if (m_debugger_window)
+	{
+		m_debugger_window->deleteLater();
+		m_debugger_window = nullptr;
+		getDebuggerWindow(); // populates m_debugger_window
+		m_debugger_window->resize(debugger_size);
+		m_debugger_window->move(debugger_pos);
+		if (debugger_is_open)
+		{
+			m_debugger_window->show();
+		}
+	}
 }
 
 void MainWindow::reloadThemeSpecificImages()
@@ -1989,6 +2017,7 @@ void MainWindow::onVMStopped()
 	m_status_fps_widget->setText(empty_string);
 	m_status_vps_widget->setText(empty_string);
 	m_status_speed_widget->setText(empty_string);
+	m_status_verbose_widget->setText(empty_string);
 
 	updateEmulationActions(false, false, false);
 	updateGameDependentActions();
