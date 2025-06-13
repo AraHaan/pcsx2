@@ -629,6 +629,8 @@ void GSTextureCache::DirtyRectByPage(u32 sbp, u32 spsm, u32 sbw, Target* t, GSVe
 	{
 		RGBAMask rgba;
 		rgba._u32 = GSUtil::GetChannelMask(spsm);
+		// FIXME: This could be a problem if used when the valid area is smaller than dirty area and it needs the data during expansion on a later draw.
+		// This happens on Kamen Rider - Seigi no Keifu if the invalidatevideomem function was to use this function for depth clearing.
 		AddDirtyRectTarget(t, t->m_valid, t->m_TEX0.PSM, t->m_TEX0.TBW, rgba);
 		return;
 	}
@@ -1192,8 +1194,8 @@ GSTextureCache::Source* GSTextureCache::LookupDepthSource(const bool is_depth, c
 		if (inside_target)
 		{
 			// Need to set it up as a region target.
-			src->m_region.SetX(block_boundary_rect.x, src->m_from_target->m_valid.z);
-			src->m_region.SetY(block_boundary_rect.y, src->m_from_target->m_valid.w);
+			src->m_region.SetX(block_boundary_rect.x, std::max(src->m_from_target->m_valid.z, block_boundary_rect.z));
+			src->m_region.SetY(block_boundary_rect.y, std::max(src->m_from_target->m_valid.w, block_boundary_rect.w));
 		}
 
 		if (GSRendererHW::GetInstance()->IsTBPFrameOrZ(dst->m_TEX0.TBP0))
@@ -1798,10 +1800,6 @@ GSTextureCache::Source* GSTextureCache::LookupSource(const bool is_color, const 
 							}
 
 							if (!t->HasValidBitsForFormat(psm, req_color, req_alpha, rt_tbw == TEX0.TBW) && !(possible_shuffle && GSLocalMemory::m_psm[psm].bpp == 16 && GSLocalMemory::m_psm[t->m_TEX0.PSM].bpp == 32))
-								continue;
-
-							// Be careful of shuffles where it can shuffle the width of the target, even though it may not have all been drawn to.
-							if (!possible_shuffle && frame.Block() != TEX0.TBP0 && !t->Inside(bp, bw, psm, block_boundary_rect))
 								continue;
 
 							x_offset = rect.x;
@@ -4367,7 +4365,9 @@ void GSTextureCache::InvalidateVideoMem(const GSOffset& off, const GSVector4i& r
 								InvalidateTemporaryZ();
 						}
 
-						if (GSLocalMemory::m_psm[psm].depth)
+						// If we're dealing with quadrant draws, we need to position them correctly (Final Fantasy X).
+						if (GSLocalMemory::m_psm[psm].depth &&
+							r.width() <= (GSLocalMemory::m_psm[psm].pgs.x >> 1) && r.height() <= (GSLocalMemory::m_psm[psm].pgs.y >> 1))
 							DirtyRectByPage(bp, psm, bw, t, r);
 						else
 							AddDirtyRectTarget(t, r, psm, bw, rgba);
@@ -4778,6 +4778,11 @@ bool GSTextureCache::Move(u32 SBP, u32 SBW, u32 SPSM, int sx, int sy, u32 DBP, u
 	}
 
 	bool req_resize = false;
+
+	// Save for later in case of page copy.
+	const u32 start_SBP = SBP;
+	const u32 start_DBP = DBP;
+
 	if (m_expected_src_bp == static_cast<int>(SBP) && m_expected_dst_bp == static_cast<int>(DBP))
 	{
 		// Get the new position so we can work out the offset.
@@ -4793,12 +4798,13 @@ bool GSTextureCache::Move(u32 SBP, u32 SBW, u32 SPSM, int sx, int sy, u32 DBP, u
 
 		SBP = m_remembered_src_bp;
 		DBP = m_remembered_dst_bp;
-
-		m_expected_src_bp = -1;
-		m_remembered_src_bp = -1;
-		m_expected_dst_bp = -1;
-		m_remembered_dst_bp = -1;
 	}
+
+	m_expected_src_bp = -1;
+	m_remembered_src_bp = -1;
+	m_expected_dst_bp = -1;
+	m_remembered_dst_bp = -1;
+
 	// Look for an exact match on the targets.
 	GSTextureCache::Target* src = GetExactTarget(SBP, SBW, spsm_s.depth ? DepthStencil : RenderTarget, SBP);
 	GSTextureCache::Target* dst = GetExactTarget(DBP, DBW, dpsm_s.depth ? DepthStencil : RenderTarget, DBP);
@@ -4862,7 +4868,7 @@ bool GSTextureCache::Move(u32 SBP, u32 SBW, u32 SPSM, int sx, int sy, u32 DBP, u
 	// If we have an offset, adjust the base positions
 	if (src->m_TEX0.TBP0 != SBP)
 	{
-		GSVector4i offset = TranslateAlignedRectByPage(dst, SBP, SPSM, SBW, GSVector4i(0, 1).xxyy(), false);
+		const GSVector4i offset = TranslateAlignedRectByPage(src, SBP, SPSM, SBW, GSVector4i(0, 1).xxyy(), false);
 
 		sx += offset.x;
 		sy += offset.y;
@@ -4870,7 +4876,7 @@ bool GSTextureCache::Move(u32 SBP, u32 SBW, u32 SPSM, int sx, int sy, u32 DBP, u
 
 	if (dst->m_TEX0.TBP0 != DBP)
 	{
-		GSVector4i offset = TranslateAlignedRectByPage(dst, DBP, DPSM, DBW, GSVector4i(0, 1).xxyy(), false);
+		const GSVector4i offset = TranslateAlignedRectByPage(dst, DBP, DPSM, DBW, GSVector4i(0, 1).xxyy(), false);
 
 		dx += offset.x;
 		dy += offset.y;
@@ -5048,18 +5054,26 @@ bool GSTextureCache::Move(u32 SBP, u32 SBW, u32 SPSM, int sx, int sy, u32 DBP, u
 	u32 page_mask = GSLocalMemory::IsPageAlignedMasked(src->m_TEX0.PSM, GSVector4i(sx, sy, sx + w, sy + h));
 	if (((page_mask & 0x0f0f) == 0x0f0f || (page_mask & 0xf0f0) == 0xf0f0) && (w == GSLocalMemory::m_psm[src->m_TEX0.PSM].pgs.x || h == GSLocalMemory::m_psm[src->m_TEX0.PSM].pgs.y))
 	{
-		// Vertical Strips
-		if (w == GSLocalMemory::m_psm[src->m_TEX0.PSM].pgs.x)
+		// Page copy
+		if (w == GSLocalMemory::m_psm[src->m_TEX0.PSM].pgs.x && h == GSLocalMemory::m_psm[src->m_TEX0.PSM].pgs.y)
+		{
+			m_expected_src_bp = start_SBP + BLOCKS_PER_PAGE;
+			m_expected_dst_bp = start_DBP + BLOCKS_PER_PAGE;
+		}
+		// Vertical Strips.
+		else if (w == GSLocalMemory::m_psm[src->m_TEX0.PSM].pgs.x)
 		{
 			m_expected_src_bp = GSLocalMemory::GetStartBlockAddress(src->m_TEX0.TBP0, src->m_TEX0.TBW, src->m_TEX0.PSM, GSVector4i(sx + w, 0, sx + w + w, h));
 			m_expected_dst_bp = GSLocalMemory::GetStartBlockAddress(dst->m_TEX0.TBP0, dst->m_TEX0.TBW, dst->m_TEX0.PSM, GSVector4i(dx + w, 0, dx + w + w, h));
 		}
+		// Horizontal Strips.
 		else
 		{
 			m_expected_src_bp = GSLocalMemory::GetStartBlockAddress(src->m_TEX0.TBP0, src->m_TEX0.TBW, src->m_TEX0.PSM, GSVector4i(0, sy + h, w, sy + h + h));
 			m_expected_dst_bp = GSLocalMemory::GetStartBlockAddress(dst->m_TEX0.TBP0, dst->m_TEX0.TBW, dst->m_TEX0.PSM, GSVector4i(0, dy + h, w, dy + h + h));
 		}
 
+		// Only check the source, the destination might need expanding.
 		if (static_cast<u32>(m_expected_src_bp) < src->UnwrappedEndBlock() && static_cast<u32>(m_expected_src_bp) >= src->m_TEX0.TBP0)
 		{
 			m_remembered_src_bp = src->m_TEX0.TBP0;
